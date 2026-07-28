@@ -8,27 +8,31 @@ load_dotenv()
 from caspian_sdk import CommClient
 
 from pgops.core.db import init_db
+from pgops.core.logging import configure_logging, get_logger
 from pgops.router import route_message
+
+log = get_logger("main")
 
 
 def main() -> None:
+    configure_logging()
     init_db()
     client = CommClient()
 
     email = client.connect_email(username=os.getenv("EMAIL_USERNAME", "pgops"))
-    print("PGOps email:", email["address"], flush=True)
+    log.info("channel_connected", channel="email", address=email["address"])
     tg = client.connect_telegram(bot_token=os.environ["TELEGRAM_BOT_TOKEN"])
-    print("PGOps telegram:", tg["address"], flush=True)
+    log.info("channel_connected", channel="telegram", address=tg["address"])
 
     @client.on_message
     def handle(message):
         try:
             route_message(message)
-        except Exception as e:  # never crash the listener
-            print(f"[ERR] {e!r}", flush=True)
+        except Exception:  # never crash the listener
+            log.exception("handler_error", conv=getattr(message, "conversation_id", None))
             message.reply("Sorry, something went wrong on my side. Please try again.")
 
-    print("PGOps listening…", flush=True)
+    log.info("listening")
     client.listen()
 
 

@@ -4,6 +4,9 @@ V0 placeholder: echoes with identification info. Intent parsing (LiteLLM)
 and flow handlers land next.
 """
 from pgops.core.db import get_db
+from pgops.core.logging import get_logger
+
+log = get_logger("router")
 
 
 def identify(message):
@@ -27,6 +30,6 @@ def route_message(message) -> None:
     person = identify(message)
     who = person["name"] if person else "stranger"
     role = person["role"] if person else "unknown"
-    print(f"[IN] {who}({role}) conv={message.conversation_id}: {message.text!r}", flush=True)
+    log.info("message_in", who=who, role=role, conv=message.conversation_id, text=message.text[:120])
     # TODO: LiteLLM intent parse -> dispatch to flows (inquiry/booking/rent/complaint/owner)
     message.reply(f"PGOps here. I recognized you as: {who} ({role}). Agent brain coming soon.")

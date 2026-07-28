@@ -6,3 +6,4 @@ data/*.db
 data/uploads/
 *.pdf
 .pytest_cache/
+docs/
