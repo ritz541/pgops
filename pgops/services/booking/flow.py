@@ -1,9 +1,4 @@
-"""Booking service: inquiry → hold → collect details → invoice → owner approval.
-
-All deterministic. Router passes parsed intent fields in; we return reply text
-(and optionally trigger owner notification via a callback the router provides).
-"""
-import os
+"""Booking service: inquiry → hold → collect details. Deterministic only."""
 from datetime import datetime, timedelta
 
 from pgops.core.db import get_db
@@ -14,11 +9,11 @@ log = get_logger("booking")
 HOLD_HOURS = 48
 
 HOUSE_INFO = {
-    "food": "Mess included: breakfast + dinner daily, lunch on Sundays. Veg only.",
-    "wifi": "100 Mbps shared fiber, included in rent.",
-    "curfew": "Gate closes 11:30 PM. Late entry with prior notice.",
-    "location": "Near JSCOE, Hadapsar, Pune. 5 min walk from the bus stop.",
-    "rules": "No smoking/alcohol on premises. Guests allowed in common area till 9 PM.",
+    "food": "🍛 Mess included: breakfast + dinner daily, lunch on Sundays. Veg only.",
+    "wifi": "📶 100 Mbps fiber, included in rent.",
+    "curfew": "🚪 Gate closes 11:30 PM (late entry with prior notice).",
+    "location": "📍 Near JSCOE, Hadapsar, Pune — 5 min from the bus stop.",
+    "rules": "House rules: no smoking/alcohol on premises; guests in common area till 9 PM.",
 }
 
 
@@ -37,19 +32,27 @@ def available_beds() -> list:
     return db.execute(
         "SELECT b.id, r.number room, r.room_type, b.label, b.rent, b.deposit "
         "FROM beds b JOIN rooms r ON r.id=b.room_id WHERE b.status='available' "
-        "ORDER BY r.number, b.label"
+        "ORDER BY b.rent, r.number, b.label"
     ).fetchall()
 
 
-def format_availability() -> str:
+def availability_blocks() -> tuple[str, list]:
+    """Returns (fallback_text, blocks) — beds grouped by type, tap-to-book buttons."""
     beds = available_beds()
     if not beds:
-        return "Sorry, no beds available right now. Want me to note your number for the waitlist?"
-    lines = ["Available beds right now:"]
-    for b in beds:
-        lines.append(f"• Room {b['room']} ({b['room_type']}) bed {b['label']} — ₹{b['rent']}/mo, deposit ₹{b['deposit']}")
-    lines.append("\nReply like: 'I'll take room 203 bed B' to reserve (held 48h).")
-    return "\n".join(lines)
+        return ("No beds free right now 😕 — want me to put you on the waitlist?", [])
+    blocks: list[dict] = [{"type": "heading", "text": "🛏️ Available beds"}]
+    items = [f"Room {b['room']} ({b['room_type']}) · bed {b['label']} — ₹{b['rent']:,}/mo (deposit ₹{b['deposit']:,})"
+             for b in beds]
+    blocks.append({"type": "list", "items": items})
+    blocks.append({"type": "text", "text": "Tap a bed to reserve it — held for 48h, no payment needed yet."})
+    blocks.append({"type": "buttons", "buttons": [
+        {"label": f"{b['room']}·{b['label']} ₹{b['rent']//1000}k", "value": f"book {b['room']} {b['label']}"}
+        for b in beds[:8]
+    ]})
+    fallback = "Available beds:\n" + "\n".join("• " + i for i in items) + \
+               "\n\nReply like 'room 203 bed B' to reserve (held 48h)."
+    return fallback, blocks
 
 
 def answer_faq(text: str) -> str | None:
@@ -60,8 +63,8 @@ def answer_faq(text: str) -> str | None:
     return "\n".join(hits) if hits else None
 
 
-def hold_bed(person_id: int, room: str, bed_label: str | None) -> str:
-    """Place a hold. Returns reply text."""
+def hold_bed(person_id: int, room: str, bed_label: str | None) -> tuple[str, list]:
+    """Place a hold. Returns (fallback_text, blocks)."""
     expire_stale_holds()
     db = get_db()
     q = ("SELECT b.id, b.status, b.rent, b.deposit, r.number, b.label FROM beds b "
@@ -70,22 +73,38 @@ def hold_bed(person_id: int, room: str, bed_label: str | None) -> str:
                       (room, bed_label.upper()) if bed_label else (room,)).fetchall()
     free = [r for r in rows if r["status"] == "available"]
     if not rows:
-        return f"I couldn't find room {room}. " + format_availability()
+        t, blk = availability_blocks()
+        return f"Hmm, I don't have a room {room}. Here's what's free:\n\n{t}", blk
     if not free:
-        return f"Room {room} has no free beds right now. " + format_availability()
+        t, blk = availability_blocks()
+        return f"Room {room} is full right now. Here's what's free:\n\n{t}", blk
     bed = free[0]
     expires = (datetime.utcnow() + timedelta(hours=HOLD_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
     db.execute("UPDATE beds SET status='held', hold_expires_at=? WHERE id=?", (expires, bed["id"]))
     db.execute("UPDATE people SET bed_id=? WHERE id=?", (bed["id"], person_id))
     db.commit()
     log.info("bed_held", person_id=person_id, room=room, bed=bed["label"])
-    return (f"Done — room {bed['number']} bed {bed['label']} is held for you for {HOLD_HOURS}h.\n"
-            f"Rent ₹{bed['rent']}/mo + deposit ₹{bed['deposit']} = ₹{bed['rent'] + bed['deposit']} to move in.\n\n"
-            "To confirm, send me: your full name, phone, email, and joining date "
-            "(e.g. 'Rahul Jadhav, 9822012345, rahul@gmail.com, joining 1 Aug').")
+    blocks = [{"type": "card",
+               "title": f"✅ Room {bed['number']} · bed {bed['label']} is yours (held 48h)",
+               "text": (f"Rent ₹{bed['rent']:,}/mo · deposit ₹{bed['deposit']:,} · "
+                        f"move-in total ₹{bed['rent'] + bed['deposit']:,}"),
+               },
+              {"type": "text",
+               "text": ("To lock it in, just send your details in one message:\n"
+                        "name, phone, email, joining date\n"
+                        "e.g. Rahul Jadhav, 9822012345, rahul@gmail.com, 1 Aug")}]
+    fallback = (f"Room {bed['number']} bed {bed['label']} is held for you (48h) ✅\n"
+                f"Rent ₹{bed['rent']:,}/mo + deposit ₹{bed['deposit']:,}.\n\n"
+                "To lock it in, send: name, phone, email, joining date — e.g. "
+                "'Rahul Jadhav, 9822012345, rahul@gmail.com, 1 Aug'.")
+    return fallback, blocks
+
+
+PRETTY = {"name": "your name", "phone": "phone number", "email": "email", "join_date": "joining date"}
 
 
 def save_details(person_id: int, fields: dict) -> str | None:
+    """Save provided details. Returns a 'still missing' message or None when complete."""
     db = get_db()
     updates, vals = [], []
     for col in ("name", "phone", "email", "join_date"):
@@ -97,7 +116,7 @@ def save_details(person_id: int, fields: dict) -> str | None:
         db.execute(f"UPDATE people SET {', '.join(updates)} WHERE id=?", vals)
         db.commit()
     p = db.execute("SELECT * FROM people WHERE id=?", (person_id,)).fetchone()
-    missing = [c for c in ("name", "phone", "email", "join_date") if not p[c]]
+    missing = [PRETTY[c] for c in ("name", "phone", "email", "join_date") if not p[c]]
     if missing:
-        return "Thanks! Still need: " + ", ".join(missing) + "."
-    return None  # complete — router will trigger invoice
+        return "Got it 👍 Just need " + " and ".join(missing) + " to finish up."
+    return None

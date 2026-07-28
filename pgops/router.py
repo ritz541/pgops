@@ -1,11 +1,11 @@
 """Orchestrator: identify sender → parse intent → dispatch to a service.
 
-Dispatch table maps (role, intent) → handler. Adding a service later =
-import it + add rows here. Nothing else changes.
+Handlers return either a string, or a (fallback_text, blocks) tuple for
+rich rendering (buttons on Telegram, HTML on email, text elsewhere).
 """
 from pgops.core.db import get_db
 from pgops.core.logging import get_logger
-from pgops.services.brain.intent import parse_intent
+from pgops.services.brain import intent as brain
 from pgops.services.booking import flow as booking
 
 log = get_logger("router")
@@ -17,8 +17,8 @@ def _addr(message):
 
 
 def identify_or_create(message):
-    """Map sender → person row. Unknown senders become new prospects.
-    Also links this conversation to the person for future lookups."""
+    """Map sender → person row; unknown senders become prospects.
+    Links the conversation to the person for future lookups."""
     db = get_db()
     addr = _addr(message)
     channel = getattr(message, "channel", None) or ("email" if "@" in addr else "telegram")
@@ -46,18 +46,29 @@ def identify_or_create(message):
     return row
 
 
-# ---- handlers: (person, fields, message) -> reply text ----
+# ---- handlers: (person, fields, message) -> str | (text, blocks) ----
 
 def h_inquiry(person, fields, message):
     faq = booking.answer_faq(message.text)
-    avail = booking.format_availability()
-    return f"{faq}\n\n{avail}" if faq else avail
+    text, blocks = booking.availability_blocks()
+    if faq:
+        return faq + "\n\n" + text, ([{"type": "text", "text": faq}] + blocks) if blocks else []
+    return text, blocks
 
 
 def h_book(person, fields, message):
     room, bed = fields.get("room"), fields.get("bed")
     if not room:
-        return "Which room would you like? " + booking.format_availability()
+        # described choice ("cheapest", "any single") → LLM resolves against live data
+        criteria = fields.get("criteria") or message.text
+        beds = booking.available_beds()
+        if not beds:
+            return booking.availability_blocks()
+        pick = brain.resolve_bed(criteria, beds)
+        if not pick:
+            text, blocks = booking.availability_blocks()
+            return "I couldn't match that to a bed. " + text, blocks
+        room, bed = pick["room"], pick.get("bed")
     return booking.hold_bed(person["id"], str(room), bed)
 
 
@@ -65,20 +76,20 @@ def h_details(person, fields, message):
     missing_msg = booking.save_details(person["id"], fields)
     if missing_msg:
         return missing_msg
-    # details complete → invoice step lands next (billing service)
-    return ("All details received ✅. I'm preparing your booking invoice — "
-            "you'll get it on email shortly.")
+    return ("Perfect, all details in ✅ Your booking invoice is on its way to "
+            "your email — reply there with the payment screenshot to confirm.")
 
 
 def h_chitchat(person, fields, message):
     if person["role"] == "owner":
-        return "Hello boss 👋 — ask me 'who hasn't paid', 'occupancy', or 'broadcast: <msg>'."
-    return ("Hi! I'm the PGOps assistant 🤖 — I manage this PG.\n"
-            "Ask me about available beds, rent, food, wifi, or rules.")
+        return "Hello boss 👋 Try: 'who hasn't paid', 'occupancy', or 'broadcast: <msg>'."
+    return ("Hey! I run this PG 🙂 I can show you free beds, prices, food & "
+            "wifi details, and book you in — right from this chat.\n"
+            "Try: 'any beds free?'")
 
 
 def h_not_implemented(person, fields, message):
-    return "That's coming soon — this part of me is still being built."
+    return "That part of me is still under construction 🚧 — soon!"
 
 
 DISPATCH = {
@@ -99,15 +110,32 @@ OWNER_ONLY = {"owner_query", "owner_approve", "broadcast"}
 
 def route_message(message) -> None:
     person = identify_or_create(message)
-    parsed = parse_intent(message.text, role=person["role"])
+    text = (message.text or "").strip()
+
+    # button callbacks come back as plain text like "book 202 C" — no LLM needed
+    if text.lower().startswith("book "):
+        parts = text.split()
+        room = parts[1] if len(parts) > 1 else None
+        bed = parts[2] if len(parts) > 2 else None
+        parsed = {"intent": "book_bed", "fields": {"room": room, "bed": bed}}
+    else:
+        parsed = brain.parse_intent(text, role=person["role"])
+
     intent, fields = parsed["intent"], parsed.get("fields", {})
     log.info("message_in", person=person["name"], role=person["role"],
-             intent=intent, conv=message.conversation_id, text=message.text[:120])
+             intent=intent, conv=message.conversation_id, text=text[:120])
 
     if intent in OWNER_ONLY and person["role"] != "owner":
-        message.reply("That's an owner-only action.")
+        message.reply("Sorry, that's an owner-only action.")
         return
+
     handler = DISPATCH.get(intent, h_chitchat)
-    reply = handler(person, fields, message)
-    if reply:
-        message.reply(reply)
+    result = handler(person, fields, message)
+    if isinstance(result, tuple):
+        fallback, blocks = result
+        if blocks:
+            message.reply(fallback, blocks=blocks)
+        else:
+            message.reply(fallback)
+    elif result:
+        message.reply(result)
