@@ -1,8 +1,10 @@
-"""Seed the PGOps DB with the demo PG: rooms, beds, rates, owner."""
-import os
-import sys
+"""Seed the PGOps DB with the demo PG: rooms, beds, rates, owner.
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+Preferred:
+    python -m scripts.seed_db
+"""
+
+import os
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,7 +21,7 @@ ROOMS = [
 ]
 
 
-def main():
+def main() -> None:
     init_db()
     db = get_db()
     if db.execute("SELECT COUNT(*) c FROM rooms").fetchone()["c"]:

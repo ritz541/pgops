@@ -1,9 +1,4 @@
 caspian-sdk
 python-dotenv
 litellm
-fastapi
-uvicorn[standard]
-jinja2
-reportlab
-python-multipart
 structlog

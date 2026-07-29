@@ -17,14 +17,15 @@ SYSTEM = """You are the intent parser for PGOps, an agent that manages a paying-
 Classify the user's message into exactly one intent and extract fields.
 
 INTENT RULES (apply in order):
-- book_bed: the user wants to book/reserve/take a bed. Triggers include:
-  * explicit room/bed: "room 202 bed A", "202 A", "get me 203B"
-  * described choice: "cheapest", "any single", "something under 8k", "which is cheaper"
-  * comparisons or recommendations: "which one is best", "what do you suggest", "cheap option"
-  * acceptance after seeing availability: "I'll take that one", "book the second one", "yes"
-- inquiry: ONLY when the user is purely asking about info and gives NO signal they want to book right now.
-  Examples: "what is the wifi speed", "do you have parking", "tell me about the mess"
-- provide_details: giving personal details (name, phone, email, joining date) — usually right after a hold.
+- inquiry: asking about information, availability, prices, or room options. Triggers include:
+  * asking for free/available beds: "any beds free", "what's available", "show rooms"
+  * asking about preferences: "cheapest", "cheapest bed", "single room", "under 8k", "which is cheaper"
+  * general questions: "wifi speed", "mess details", "curfew", "location"
+- book_bed: the user explicitly wants to book, reserve, hold, or take a specific bed. Triggers include:
+  * explicit room/bed request: "book room 202 bed A", "book 202A", "hold 101 A", "reserve 203 B"
+  * explicit commitment: "I want to book", "I'll take 202 A", "lock in 101A", "yes book it"
+  * button value: "book 202 A"
+- provide_details: giving personal details (name, phone, email, joining date).
 - payment_claim: says they paid / sent money / attached a screenshot.
 - my_status: asks their own balance, rent due, booking status.
 - complaint: reports a problem.
@@ -33,12 +34,10 @@ INTENT RULES (apply in order):
 - broadcast (owner only): send an announcement.
 - chitchat: greetings, thanks, capability questions, anything else.
 
-DEFAULT TO book_bed when the user is evaluating beds or expressing preference — only use inquiry if they're clearly asking a fact question.
-
 Return STRICT JSON, no markdown fences:
 {"intent":"...","fields":{"room":null,"bed":null,"criteria":null,"name":null,"phone":null,"email":null,"join_date":null,"decision":null,"person":null,"amount":null,"text":null}}
 - room/bed: only if named explicitly (e.g. "203 B").
-- criteria: for book_bed/inquiry when choice is described, copy the description (e.g. "cheapest").
+- criteria: for inquiry, extract filter description (e.g. "cheapest", "single", "double", "under 8k").
 - join_date: normalize to ISO YYYY-MM-DD (assume 2026 if year missing).
 Only include fields actually present. Use null otherwise.
 """
@@ -49,26 +48,25 @@ Never invent beds not in the list."""
 
 
 def _complete(system: str, user: str, max_tokens: int = 300) -> str:
-    models = [
-        dict(model=os.getenv("LLM_MODEL"), api_key=os.getenv("AGNES_API_KEY"),
-             base_url=os.getenv("LLM_BASE_URL")),
-        dict(model=os.getenv("LLM_FALLBACK_MODEL"), api_key=os.getenv("OPENROUTER_API_KEY")),
-    ]
-    last = None
-    for m in models:
-        try:
-            resp = litellm.completion(
-                messages=[{"role": "system", "content": system},
-                          {"role": "user", "content": user}],
-                temperature=0.1, max_tokens=max_tokens, timeout=25, **m,
-            )
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
-            last = e
-            log.warning("llm_call_failed", model=m.get("model"), error=str(e)[:200])
-    raise RuntimeError(f"all LLM models failed: {last}")
+    model = os.getenv("LLM_MODEL", "openrouter/inclusionai/ling-3.0-flash:free")
+    if not model:
+        raise RuntimeError("LLM_MODEL is not set")
 
+    kwargs = {}
+    if os.getenv("OPENROUTER_API_KEY"):
+        kwargs["api_key"] = os.getenv("OPENROUTER_API_KEY")
 
+    try:
+        resp = litellm.completion(
+            model=model,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            temperature=0.1, max_tokens=max_tokens, timeout=25, **kwargs,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        log.warning("llm_call_failed", model=model, error=str(e)[:200])
+        raise RuntimeError(f"LLM call failed: {e}") from e
 def _json(raw: str) -> dict:
     if raw.startswith("```"):
         raw = raw.strip("`").removeprefix("json").strip()
@@ -89,18 +87,32 @@ def parse_intent(text: str, role: str) -> dict:
         return {"intent": "chitchat", "fields": {}}
 
 
-def resolve_bed(request: str, beds: list) -> dict | None:
-    """Pick a bed matching a described request ('cheapest', 'any single'...).
-    beds: rows with room, room_type, label, rent, deposit. Returns
-    {"room":..., "bed":..., "reason":...} or None."""
-    listing = "\n".join(
-        f"room {b['room']} ({b['room_type']}) bed {b['label']}: rent {b['rent']}/mo, deposit {b['deposit']}"
-        for b in beds)
-    try:
-        out = _json(_complete(RESOLVER, f"Request: {request}\nAvailable beds:\n{listing}", 150))
-        if out.get("room"):
-            log.info("bed_resolved", room=out["room"], bed=out.get("bed"), reason=out.get("reason"))
-            return out
-    except Exception:
-        log.exception("bed_resolve_failed")
-    return None
+def resolve_bed(request: str | None, beds: list) -> dict | None:
+    """Pick a bed matching criteria ('cheapest', 'single', etc.) deterministically in Python (0ms).
+    beds: list of dicts/Rows with room, room_type, label, rent, deposit."""
+    if not beds:
+        return None
+    if not request:
+        b = beds[0]
+        return {"room": str(b["room"]), "bed": b["label"], "reason": "First available"}
+
+    c = request.lower()
+    if "single" in c:
+        singles = [b for b in beds if b["room_type"] == "single"]
+        if singles:
+            b = singles[0]
+            return {"room": str(b["room"]), "bed": b["label"], "reason": "Single room"}
+    if "double" in c:
+        doubles = [b for b in beds if b["room_type"] == "double"]
+        if doubles:
+            b = doubles[0]
+            return {"room": str(b["room"]), "bed": b["label"], "reason": "Double sharing"}
+    if "triple" in c:
+        triples = [b for b in beds if b["room_type"] == "triple"]
+        if triples:
+            b = triples[0]
+            return {"room": str(b["room"]), "bed": b["label"], "reason": "Triple sharing"}
+
+    # Default: cheapest (beds is already sorted by rent)
+    b = beds[0]
+    return {"room": str(b["room"]), "bed": b["label"], "reason": f"Cheapest at ₹{b['rent']:,}/mo"}

@@ -1,33 +1,12 @@
-"""Structured logging for PGOps (structlog).
-
-Usage:
-    from pgops.core.logging import get_logger
-    log = get_logger("router")
-    log.info("message_in", sender=addr, channel="telegram", conv=conv_id)
-"""
 import logging
-import sys
-
-import structlog
 
 
 def configure_logging(level: str = "INFO") -> None:
-    logging.basicConfig(format="%(message)s", stream=sys.stdout, level=level)
-    structlog.configure(
-        processors=[
-            structlog.contextvars.merge_contextvars,
-            structlog.processors.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.StackInfoRenderer(),
-            structlog.processors.format_exc_info,
-            structlog.dev.ConsoleRenderer(colors=sys.stdout.isatty()),
-        ],
-        wrapper_class=structlog.make_filtering_bound_logger(
-            getattr(logging, level.upper(), logging.INFO)
-        ),
-        cache_logger_on_first_use=True,
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+        level=getattr(logging, level.upper(), logging.INFO),
     )
 
 
-def get_logger(name: str):
-    return structlog.get_logger(service=name)
+def get_logger(name: str) -> logging.Logger:
+    return logging.getLogger(name)

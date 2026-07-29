@@ -50,7 +50,18 @@ def identify_or_create(message):
 
 def h_inquiry(person, fields, message):
     faq = booking.answer_faq(message.text)
+    criteria = fields.get("criteria")
+    beds = booking.available_beds()
+    
     text, blocks = booking.availability_blocks()
+    if criteria and beds:
+        pick = brain.resolve_bed(criteria, beds)
+        if pick:
+            prefix = f"💡 **Recommended ({pick.get('reason')}):** Room {pick['room']} Bed {pick.get('bed', 'A')}\n\n"
+            text = prefix + text
+            if blocks and blocks[0].get("type") == "heading":
+                blocks.insert(1, {"type": "text", "text": f"💡 Recommended for '{criteria}': Room {pick['room']} Bed {pick.get('bed', 'A')}"})
+    
     if faq:
         return faq + "\n\n" + text, ([{"type": "text", "text": faq}] + blocks) if blocks else []
     return text, blocks
@@ -59,7 +70,6 @@ def h_inquiry(person, fields, message):
 def h_book(person, fields, message):
     room, bed = fields.get("room"), fields.get("bed")
     if not room:
-        # described choice ("cheapest", "any single") → LLM resolves against live data
         criteria = fields.get("criteria") or message.text
         beds = booking.available_beds()
         if not beds:
@@ -71,7 +81,6 @@ def h_book(person, fields, message):
         room, bed = pick["room"], pick.get("bed")
     return booking.hold_bed(person["id"], str(room), bed)
 
-
 def h_details(person, fields, message):
     missing_msg = booking.save_details(person["id"], fields)
     if missing_msg:
@@ -81,15 +90,9 @@ def h_details(person, fields, message):
 
 
 def h_chitchat(person, fields, message):
-    if person["role"] == "owner":
-        return "Hello boss 👋 Try: 'who hasn't paid', 'occupancy', or 'broadcast: <msg>'."
     return ("Hey! I run this PG 🙂 I can show you free beds, prices, food & "
             "wifi details, and book you in — right from this chat.\n"
             "Try: 'any beds free?'")
-
-
-def h_not_implemented(person, fields, message):
-    return "That part of me is still under construction 🚧 — soon!"
 
 
 DISPATCH = {
@@ -97,15 +100,7 @@ DISPATCH = {
     "book_bed": h_book,
     "provide_details": h_details,
     "chitchat": h_chitchat,
-    "payment_claim": h_not_implemented,
-    "my_status": h_not_implemented,
-    "complaint": h_not_implemented,
-    "owner_query": h_not_implemented,
-    "owner_approve": h_not_implemented,
-    "broadcast": h_not_implemented,
 }
-
-OWNER_ONLY = {"owner_query", "owner_approve", "broadcast"}
 
 
 def route_message(message) -> None:
@@ -124,10 +119,6 @@ def route_message(message) -> None:
     intent, fields = parsed["intent"], parsed.get("fields", {})
     log.info("message_in", person=person["name"], role=person["role"],
              intent=intent, conv=message.conversation_id, text=text[:120])
-
-    if intent in OWNER_ONLY and person["role"] != "owner":
-        message.reply("Sorry, that's an owner-only action.")
-        return
 
     handler = DISPATCH.get(intent, h_chitchat)
     result = handler(person, fields, message)
