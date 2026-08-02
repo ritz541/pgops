@@ -9,7 +9,7 @@ from caspian_sdk import CommClient
 
 from pgops.core.db import init_db
 from pgops.core.logging import configure_logging, get_logger
-from pgops.router import route_message
+from pgops.router import interaction_reply, route_interaction, route_message
 
 log = get_logger("main")
 
@@ -31,6 +31,14 @@ def main() -> None:
         except Exception:  # never crash the listener
             log.exception("handler_error", conv=getattr(message, "conversation_id", None))
             message.reply("Sorry, something went wrong on my side. Please try again.")
+
+    @client.on_interaction
+    def handle_interaction(interaction):
+        try:
+            route_interaction(interaction)
+        except Exception:  # never crash the listener
+            log.exception("interaction_error", value=getattr(interaction, "value", None))
+            interaction_reply(interaction, "Sorry, something went wrong on my side. Please try again.")
 
     log.info("listening")
     client.listen()

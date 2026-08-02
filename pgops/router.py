@@ -3,6 +3,8 @@
 Handlers return either a string, or a (fallback_text, blocks) tuple for
 rich rendering (buttons on Telegram, HTML on email, text elsewhere).
 """
+from types import SimpleNamespace
+
 from pgops.core.db import get_db
 from pgops.core.logging import get_logger
 from pgops.services.brain import intent as brain
@@ -101,6 +103,38 @@ DISPATCH = {
     "provide_details": h_details,
     "chitchat": h_chitchat,
 }
+
+
+def interaction_reply(interaction, text, blocks=None) -> None:
+    """Reply to a button tap. The source message may be the bot's own outbound
+    message, which the gateway refuses as a reply target — send a fresh message
+    into the conversation instead. Never raises."""
+    conv_id = interaction.conversation_id or (interaction.source_message or {}).get("conversation_id")
+    if not conv_id:
+        log.warning("interaction_reply_no_conversation", value=interaction.value)
+        return
+    try:
+        interaction._client.send_message(conv_id, text=text, blocks=blocks)
+    except Exception as e:
+        log.warning("interaction_reply_failed", value=interaction.value, error=str(e)[:200])
+
+
+def route_interaction(interaction) -> None:
+    """Handle a button tap (interaction.received). Reuses the message path."""
+    if not interaction.source_message:
+        log.warning("interaction_no_source", value=interaction.value)
+        return
+    conv_id = interaction.conversation_id or interaction.source_message.get("conversation_id")
+    if not conv_id:
+        log.warning("interaction_no_conversation", value=interaction.value)
+        return
+    route_message(SimpleNamespace(
+        text=interaction.value,
+        conversation_id=conv_id,
+        sender=interaction.sender,
+        channel=interaction.source_message.get("channel", "telegram"),
+        reply=lambda text, blocks=None, **kw: interaction_reply(interaction, text, blocks),
+    ))
 
 
 def route_message(message) -> None:
